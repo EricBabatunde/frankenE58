@@ -64,7 +64,6 @@ static constexpr uint8_t MPU6050_CLK_SEL_X_GYRO = 0x01;
 //  IMU burst-read length: 3×accel + temp + 3×gyro = 14 bytes
 static constexpr size_t IMU_BURST_READ_LEN = 14;
 
-
 // ============================================================================
 //  I2C Master Bus Initialisation
 // ============================================================================
@@ -246,14 +245,25 @@ static void flight_control_loop_task(void *pvParameters)
         }
         else
         {
-            // Debug-level trace: only visible with CORE_DEBUG_LEVEL >= 4
-            // This lets us profile real I2C transaction overhead without
-            // flooding the console at lower log verbosity settings.
+            // ── Parse 14-byte big-endian IMU payload into signed 16-bit ──
+            // Register map from 0x3B: AX_H AX_L AY_H AY_L AZ_H AZ_L
+            //                         TH   TL   GX_H GX_L GY_H GY_L GZ_H GZ_L
+            int16_t accel_x = (int16_t)((imu_raw[0] << 8) | imu_raw[1]);
+            int16_t accel_y = (int16_t)((imu_raw[2] << 8) | imu_raw[3]);
+            int16_t accel_z = (int16_t)((imu_raw[4] << 8) | imu_raw[5]);
+            int16_t temp_raw = (int16_t)((imu_raw[6] << 8) | imu_raw[7]);
+            int16_t gyro_x = (int16_t)((imu_raw[8] << 8) | imu_raw[9]);
+            int16_t gyro_y = (int16_t)((imu_raw[10] << 8) | imu_raw[11]);
+            int16_t gyro_z = (int16_t)((imu_raw[12] << 8) | imu_raw[13]);
+
+            // Suppress unused-variable warning — temp_raw reserved for Phase 2
+            (void)temp_raw;
+
             ESP_LOGI(TAG,
-                     "SLA | loop=%lu | i2c_burst_µs=%lld | 14B from 0x%02X",
-                     (unsigned long)loop_count,
+                     "µs: %lld | Ax: %d Ay: %d Az: %d | Gx: %d Gy: %d Gz: %d",
                      (long long)t_elapsed,
-                     MPU6050_REG_ACCEL_XOUT);
+                     accel_x, accel_y, accel_z,
+                     gyro_x, gyro_y, gyro_z);
         }
 
         loop_count++;
