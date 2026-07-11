@@ -64,15 +64,6 @@ static constexpr uint8_t MPU6050_CLK_SEL_X_GYRO = 0x01;
 //  IMU burst-read length: 3×accel + temp + 3×gyro = 14 bytes
 static constexpr size_t IMU_BURST_READ_LEN = 14;
 
-// ============================================================================
-//  Flight Loop Timing
-// ============================================================================
-//  Target loop frequency: 400 Hz → 2500 µs period.
-//  Using vTaskDelayUntil for deterministic cadence.
-// ============================================================================
-static constexpr TickType_t LOOP_PERIOD_TICKS =
-    pdMS_TO_TICKS(2); // 2 ms ≈ 500 Hz ceiling; FreeRTOS tick granularity
-                      // rounds 2.5 ms → 2 ms. Acceptable for Phase 1.
 
 // ============================================================================
 //  I2C Master Bus Initialisation
@@ -231,10 +222,9 @@ static void flight_control_loop_task(void *pvParameters)
     }
 
     ESP_LOGI(TAG, "✓ MPU-6050 awake — clock source: X-axis gyro PLL");
-    ESP_LOGI(TAG, "✓ Entering 400 Hz flight control loop");
+    ESP_LOGI(TAG, "✓ Entering 100 Hz flight control loop");
 
     // ── Step 2: Deterministic control loop ────────────────────────────────
-    TickType_t xLastWakeTime = xTaskGetTickCount();
     uint8_t imu_raw[IMU_BURST_READ_LEN] = {};
     uint32_t loop_count = 0;
 
@@ -259,7 +249,7 @@ static void flight_control_loop_task(void *pvParameters)
             // Debug-level trace: only visible with CORE_DEBUG_LEVEL >= 4
             // This lets us profile real I2C transaction overhead without
             // flooding the console at lower log verbosity settings.
-            ESP_LOGD(TAG,
+            ESP_LOGI(TAG,
                      "SLA | loop=%lu | i2c_burst_µs=%lld | 14B from 0x%02X",
                      (unsigned long)loop_count,
                      (long long)t_elapsed,
@@ -268,8 +258,8 @@ static void flight_control_loop_task(void *pvParameters)
 
         loop_count++;
 
-        // ── Yield to scheduler: deterministic cadence via vTaskDelayUntil
-        vTaskDelayUntil(&xLastWakeTime, LOOP_PERIOD_TICKS);
+        // Temporary 100Hz delay to bypass FreeRTOS integer division crash during Phase 1 timing validation.
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 
     // Unreachable — flight loop never exits. Defensive cleanup.
