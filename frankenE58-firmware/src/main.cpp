@@ -1,0 +1,320 @@
+/**
+ * ============================================================================
+ *  Franken-E58 Micro-Quadcopter — Phase 1 Flight Core Bootstrap
+ * ============================================================================
+ *
+ *  Target MCU  : ESP32-S3-DevKitC-1
+ *  Framework   : ESP-IDF (native, C++ compilation unit)
+ *  Sensor      : MPU-6050 (I2C @ 0x68)
+ *  Bus Config  : 100 kHz — derated for ~20 cm jumper wire signal integrity
+ *
+ *  This file establishes:
+ *    1. I2C master bus initialisation with defensive pull-up configuration.
+ *    2. MPU-6050 power management wake sequence (register-level).
+ *    3. A 400 Hz flight control loop pinned to Core 1 with a software
+ *       logic analyser (SLA) timing harness for transaction profiling.
+ *
+ *  All operations are non-blocking; the main app_main thread yields
+ *  immediately after task creation.
+ *
+ *  Author : Eric Babatunde
+ *  Date   : 2026-07-11
+ * ============================================================================
+ */
+
+// ── Compilation Guard ────────────────────────────────────────────────────────
+#ifndef __cplusplus
+#error "This translation unit requires a C++ compiler. Check framework config."
+#endif
+
+// ── ESP-IDF System Headers ───────────────────────────────────────────────────
+#include "driver/i2c.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+// ── Diagnostic Log Tag ───────────────────────────────────────────────────────
+static const char* TAG = "FLIGHT_CORE";
+
+// ============================================================================
+//  I2C Bus Configuration Constants
+// ============================================================================
+//  CLK derated to 100 kHz: the E58 breadboard prototype uses ~20 cm dupont
+//  jumper wires which introduce parasitic capacitance. 400 kHz fast-mode
+//  will be re-evaluated once the PCB revision lands.
+// ============================================================================
+static constexpr i2c_port_t  I2C_MASTER_NUM  = I2C_NUM_0;
+static constexpr gpio_num_t  SDA_IO          = GPIO_NUM_1;
+static constexpr gpio_num_t  SCL_IO          = GPIO_NUM_2;
+static constexpr uint32_t    CLK_SPEED_HZ    = 100000;  // 100 kHz
+
+// ============================================================================
+//  MPU-6050 Register Map (subset for Phase 1)
+// ============================================================================
+static constexpr uint8_t MPU6050_ADDR           = 0x68;
+static constexpr uint8_t MPU6050_REG_PWR_MGMT_1 = 0x6B;
+static constexpr uint8_t MPU6050_REG_ACCEL_XOUT = 0x3B;
+
+//  PWR_MGMT_1 payload: clear SLEEP bit, select X-axis gyroscope PLL as
+//  clock source (CLKSEL = 0x01) for improved stability over the internal
+//  RC oscillator.
+static constexpr uint8_t MPU6050_CLK_SEL_X_GYRO = 0x01;
+
+//  IMU burst-read length: 3×accel + temp + 3×gyro = 14 bytes
+static constexpr size_t IMU_BURST_READ_LEN = 14;
+
+// ============================================================================
+//  Flight Loop Timing
+// ============================================================================
+//  Target loop frequency: 400 Hz → 2500 µs period.
+//  Using vTaskDelayUntil for deterministic cadence.
+// ============================================================================
+static constexpr TickType_t LOOP_PERIOD_TICKS =
+    pdMS_TO_TICKS(2);  // 2 ms ≈ 500 Hz ceiling; FreeRTOS tick granularity
+                        // rounds 2.5 ms → 2 ms. Acceptable for Phase 1.
+
+// ============================================================================
+//  I2C Master Bus Initialisation
+// ============================================================================
+/**
+ * @brief Configure and install the I2C master driver on I2C_NUM_0.
+ *
+ * Internal pull-ups are enabled as a defensive fallback. The hardware
+ * prototype carries external 4.7 kΩ pull-ups on SDA/SCL; the internal
+ * weak pull-ups (~45 kΩ) act in parallel and have negligible effect on
+ * rise-time when the external resistors are present.
+ *
+ * @return ESP_OK on success, or an esp_err_t error code on failure.
+ */
+static esp_err_t i2c_master_init(void)
+{
+    const i2c_config_t conf = {
+        .mode             = I2C_MODE_MASTER,
+        .sda_io_num       = SDA_IO,
+        .scl_io_num       = SCL_IO,
+        .sda_pullup_en    = GPIO_PULLUP_ENABLE,   // Internal pull-up backup
+        .scl_pullup_en    = GPIO_PULLUP_ENABLE,   // Internal pull-up backup
+        .master = {
+            .clk_speed    = CLK_SPEED_HZ,
+        },
+        .clk_flags        = 0,                     // Default clock source
+    };
+
+    esp_err_t err = i2c_param_config(I2C_MASTER_NUM, &conf);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "✗ I2C param config failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(TAG, "✓ I2C bus parameters configured  [SDA=%d SCL=%d @ %lu Hz]",
+             SDA_IO, SCL_IO, (unsigned long)CLK_SPEED_HZ);
+
+    err = i2c_driver_install(I2C_MASTER_NUM, I2C_MODE_MASTER, 0, 0, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "✗ I2C driver install failed (bus allocation): %s",
+                 esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(TAG, "✓ I2C master driver installed on port %d", I2C_MASTER_NUM);
+
+    return ESP_OK;
+}
+
+// ============================================================================
+//  MPU-6050 Wake Sequence
+// ============================================================================
+/**
+ * @brief Write to PWR_MGMT_1 to bring the MPU-6050 out of default sleep mode.
+ *
+ * On power-on-reset the MPU-6050 enters SLEEP mode (bit 6 of 0x6B is set).
+ * Writing 0x01 clears SLEEP and selects the X-axis gyroscope PLL as the
+ * clock reference — more accurate than the 8 MHz internal oscillator.
+ *
+ * @return ESP_OK on success, or the I2C transaction error code.
+ */
+static esp_err_t mpu6050_wake(void)
+{
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, MPU6050_REG_PWR_MGMT_1, true);
+    i2c_master_write_byte(cmd, MPU6050_CLK_SEL_X_GYRO, true);
+    i2c_master_stop(cmd);
+
+    esp_err_t err = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd,
+                                         pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+
+    return err;
+}
+
+// ============================================================================
+//  IMU Burst-Read (Mock Phase 1)
+// ============================================================================
+/**
+ * @brief Perform a 14-byte burst read starting at register 0x3B.
+ *
+ * Reads accelerometer (6B), temperature (2B), and gyroscope (6B) data
+ * in a single I2C transaction — the MPU-6050 auto-increments the register
+ * pointer. In Phase 1 this data is captured but not yet fused; the primary
+ * objective is to validate bus timing and transaction integrity.
+ *
+ * @param[out] buffer  Pre-allocated buffer of at least IMU_BURST_READ_LEN.
+ * @return ESP_OK on success, or the I2C transaction error code.
+ */
+static esp_err_t mpu6050_burst_read(uint8_t* buffer)
+{
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+
+    // Phase 1 — Write the starting register address
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, MPU6050_REG_ACCEL_XOUT, true);
+
+    // Phase 2 — Repeated-start and read 14 bytes
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_READ, true);
+    i2c_master_read(cmd, buffer, IMU_BURST_READ_LEN, I2C_MASTER_LAST_NACK);
+    i2c_master_stop(cmd);
+
+    esp_err_t err = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd,
+                                         pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+
+    return err;
+}
+
+// ============================================================================
+//  Flight Control Loop — Core 1 Task
+// ============================================================================
+/**
+ * @brief Primary flight control loop executing at ~400 Hz on Core 1.
+ *
+ * Lifecycle:
+ *   1. Wake the MPU-6050 — hard-fault on failure (safe infinite loop).
+ *   2. Enter deterministic control loop with SLA timing harness.
+ *   3. Each iteration: burst-read IMU data → log transaction duration.
+ *
+ * Phase 1 does NOT perform sensor fusion or motor output. That is
+ * deferred to Phase 2 (complementary filter) and Phase 3 (PID → ESC PWM).
+ *
+ * @param pvParameters  Unused; reserved for future config struct passthrough.
+ */
+static void flight_control_loop_task(void* pvParameters)
+{
+    (void)pvParameters;  // Suppress unused-parameter warning
+
+    ESP_LOGI(TAG, "━━━ Flight Control Task started on Core %d ━━━",
+             xPortGetCoreID());
+
+    // ── Step 1: Wake MPU-6050 ────────────────────────────────────────────
+    ESP_LOGI(TAG, "⏳ Waking MPU-6050 (PWR_MGMT_1 ← 0x%02X)...",
+             MPU6050_CLK_SEL_X_GYRO);
+
+    esp_err_t wake_err = mpu6050_wake();
+    if (wake_err != ESP_OK) {
+        ESP_LOGE(TAG, "✗ CRITICAL: MPU-6050 wake FAILED: %s",
+                 esp_err_to_name(wake_err));
+        ESP_LOGE(TAG, "  → Entering safe infinite loop. Check I2C wiring.");
+        ESP_LOGE(TAG, "  → Verify: SDA=%d, SCL=%d, VCC=3.3V, ADDR=0x%02X",
+                 SDA_IO, SCL_IO, MPU6050_ADDR);
+
+        // ── Safe halt: prevent downstream instability ────────────────────
+        for (;;) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+
+    ESP_LOGI(TAG, "✓ MPU-6050 awake — clock source: X-axis gyro PLL");
+    ESP_LOGI(TAG, "✓ Entering 400 Hz flight control loop");
+
+    // ── Step 2: Deterministic control loop ────────────────────────────────
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    uint8_t imu_raw[IMU_BURST_READ_LEN] = {};
+    uint32_t loop_count = 0;
+
+    for (;;) {
+        // ── SLA Timing Harness: capture pre-transaction timestamp ────────
+        int64_t t_start = esp_timer_get_time();  // Microsecond precision
+
+        // ── Burst-read 14 bytes of IMU telemetry from 0x3B ──────────────
+        esp_err_t read_err = mpu6050_burst_read(imu_raw);
+
+        // ── SLA Timing Harness: compute transaction delta ────────────────
+        int64_t t_elapsed = esp_timer_get_time() - t_start;
+
+        if (read_err != ESP_OK) {
+            ESP_LOGW(TAG, "⚠ IMU read error @ loop %lu: %s",
+                     (unsigned long)loop_count, esp_err_to_name(read_err));
+        } else {
+            // Debug-level trace: only visible with CORE_DEBUG_LEVEL >= 4
+            // This lets us profile real I2C transaction overhead without
+            // flooding the console at lower log verbosity settings.
+            ESP_LOGD(TAG,
+                     "SLA | loop=%lu | i2c_burst_µs=%lld | 14B from 0x%02X",
+                     (unsigned long)loop_count,
+                     (long long)t_elapsed,
+                     MPU6050_REG_ACCEL_XOUT);
+        }
+
+        loop_count++;
+
+        // ── Yield to scheduler: deterministic cadence via vTaskDelayUntil
+        vTaskDelayUntil(&xLastWakeTime, LOOP_PERIOD_TICKS);
+    }
+
+    // Unreachable — flight loop never exits. Defensive cleanup.
+    vTaskDelete(NULL);
+}
+
+// ============================================================================
+//  Application Entry Point
+// ============================================================================
+/**
+ * @brief ESP-IDF application entry point.
+ *
+ * Initialises the I2C master bus and spawns the flight control task on Core 1.
+ * After task creation, app_main returns and its stack is reclaimed by the
+ * idle task — all real-time work lives in the pinned FreeRTOS task.
+ */
+extern "C" void app_main(void)
+{
+    ESP_LOGI(TAG, "╔══════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║   Franken-E58  •  Phase 1 Flight Core Bootstrap ║");
+    ESP_LOGI(TAG, "║   ESP32-S3  •  MPU-6050  •  ESP-IDF / FreeRTOS  ║");
+    ESP_LOGI(TAG, "╚══════════════════════════════════════════════════╝");
+
+    // ── I2C Bus Initialisation ───────────────────────────────────────────
+    ESP_LOGI(TAG, "⏳ Initialising I2C master bus...");
+    esp_err_t i2c_err = i2c_master_init();
+    if (i2c_err != ESP_OK) {
+        ESP_LOGE(TAG, "✗ FATAL: I2C init failed — aborting task creation.");
+        ESP_LOGE(TAG, "  → System halted. Diagnose bus hardware and reboot.");
+        return;  // app_main returns; system remains alive but inert.
+    }
+    ESP_LOGI(TAG, "✓ I2C master bus ready");
+
+    // ── Spawn Flight Control Task on Core 1 ──────────────────────────────
+    //  Core 0: WiFi/BT stack + system tasks (reserved for Phase 4 telemetry)
+    //  Core 1: Real-time flight control (latency-critical)
+    ESP_LOGI(TAG, "⏳ Spawning flight_control_loop_task → Core 1...");
+
+    BaseType_t task_err = xTaskCreatePinnedToCore(
+        flight_control_loop_task,   // Task function
+        "flight_ctrl",              // Human-readable name (max 16 chars)
+        4096,                       // Stack depth in bytes
+        NULL,                       // Parameters (unused in Phase 1)
+        10,                         // Priority: high (above default 1)
+        NULL,                       // Task handle (not needed yet)
+        1                           // Pin to Core 1
+    );
+
+    if (task_err != pdPASS) {
+        ESP_LOGE(TAG, "✗ FATAL: Failed to create flight control task!");
+        return;
+    }
+
+    ESP_LOGI(TAG, "✓ Flight control task created [core=1 prio=10 stack=4096B]");
+    ESP_LOGI(TAG, "━━━ app_main complete — yielding to scheduler ━━━");
+}
