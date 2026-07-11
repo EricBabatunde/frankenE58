@@ -35,7 +35,7 @@
 #include "freertos/task.h"
 
 // ── Diagnostic Log Tag ───────────────────────────────────────────────────────
-static const char* TAG = "FLIGHT_CORE";
+static const char *TAG = "FLIGHT_CORE";
 
 // ============================================================================
 //  I2C Bus Configuration Constants
@@ -44,15 +44,15 @@ static const char* TAG = "FLIGHT_CORE";
 //  jumper wires which introduce parasitic capacitance. 400 kHz fast-mode
 //  will be re-evaluated once the PCB revision lands.
 // ============================================================================
-static constexpr i2c_port_t  I2C_MASTER_NUM  = I2C_NUM_0;
-static constexpr gpio_num_t  SDA_IO          = GPIO_NUM_1;
-static constexpr gpio_num_t  SCL_IO          = GPIO_NUM_2;
-static constexpr uint32_t    CLK_SPEED_HZ    = 100000;  // 100 kHz
+static constexpr i2c_port_t I2C_MASTER_NUM = I2C_NUM_0;
+static constexpr gpio_num_t SDA_IO = GPIO_NUM_8;
+static constexpr gpio_num_t SCL_IO = GPIO_NUM_9;
+static constexpr uint32_t CLK_SPEED_HZ = 100000; // 100 kHz
 
 // ============================================================================
 //  MPU-6050 Register Map (subset for Phase 1)
 // ============================================================================
-static constexpr uint8_t MPU6050_ADDR           = 0x68;
+static constexpr uint8_t MPU6050_ADDR = 0x68;
 static constexpr uint8_t MPU6050_REG_PWR_MGMT_1 = 0x6B;
 static constexpr uint8_t MPU6050_REG_ACCEL_XOUT = 0x3B;
 
@@ -71,8 +71,8 @@ static constexpr size_t IMU_BURST_READ_LEN = 14;
 //  Using vTaskDelayUntil for deterministic cadence.
 // ============================================================================
 static constexpr TickType_t LOOP_PERIOD_TICKS =
-    pdMS_TO_TICKS(2);  // 2 ms ≈ 500 Hz ceiling; FreeRTOS tick granularity
-                        // rounds 2.5 ms → 2 ms. Acceptable for Phase 1.
+    pdMS_TO_TICKS(2); // 2 ms ≈ 500 Hz ceiling; FreeRTOS tick granularity
+                      // rounds 2.5 ms → 2 ms. Acceptable for Phase 1.
 
 // ============================================================================
 //  I2C Master Bus Initialisation
@@ -90,19 +90,20 @@ static constexpr TickType_t LOOP_PERIOD_TICKS =
 static esp_err_t i2c_master_init(void)
 {
     const i2c_config_t conf = {
-        .mode             = I2C_MODE_MASTER,
-        .sda_io_num       = SDA_IO,
-        .scl_io_num       = SCL_IO,
-        .sda_pullup_en    = GPIO_PULLUP_ENABLE,   // Internal pull-up backup
-        .scl_pullup_en    = GPIO_PULLUP_ENABLE,   // Internal pull-up backup
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = SDA_IO,
+        .scl_io_num = SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE, // Internal pull-up backup
+        .scl_pullup_en = GPIO_PULLUP_ENABLE, // Internal pull-up backup
         .master = {
-            .clk_speed    = CLK_SPEED_HZ,
+            .clk_speed = CLK_SPEED_HZ,
         },
-        .clk_flags        = 0,                     // Default clock source
+        .clk_flags = 0, // Default clock source
     };
 
     esp_err_t err = i2c_param_config(I2C_MASTER_NUM, &conf);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGE(TAG, "✗ I2C param config failed: %s", esp_err_to_name(err));
         return err;
     }
@@ -110,7 +111,8 @@ static esp_err_t i2c_master_init(void)
              SDA_IO, SCL_IO, (unsigned long)CLK_SPEED_HZ);
 
     err = i2c_driver_install(I2C_MASTER_NUM, I2C_MODE_MASTER, 0, 0, 0);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGE(TAG, "✗ I2C driver install failed (bus allocation): %s",
                  esp_err_to_name(err));
         return err;
@@ -163,7 +165,7 @@ static esp_err_t mpu6050_wake(void)
  * @param[out] buffer  Pre-allocated buffer of at least IMU_BURST_READ_LEN.
  * @return ESP_OK on success, or the I2C transaction error code.
  */
-static esp_err_t mpu6050_burst_read(uint8_t* buffer)
+static esp_err_t mpu6050_burst_read(uint8_t *buffer)
 {
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
 
@@ -201,9 +203,9 @@ static esp_err_t mpu6050_burst_read(uint8_t* buffer)
  *
  * @param pvParameters  Unused; reserved for future config struct passthrough.
  */
-static void flight_control_loop_task(void* pvParameters)
+static void flight_control_loop_task(void *pvParameters)
 {
-    (void)pvParameters;  // Suppress unused-parameter warning
+    (void)pvParameters; // Suppress unused-parameter warning
 
     ESP_LOGI(TAG, "━━━ Flight Control Task started on Core %d ━━━",
              xPortGetCoreID());
@@ -213,7 +215,8 @@ static void flight_control_loop_task(void* pvParameters)
              MPU6050_CLK_SEL_X_GYRO);
 
     esp_err_t wake_err = mpu6050_wake();
-    if (wake_err != ESP_OK) {
+    if (wake_err != ESP_OK)
+    {
         ESP_LOGE(TAG, "✗ CRITICAL: MPU-6050 wake FAILED: %s",
                  esp_err_to_name(wake_err));
         ESP_LOGE(TAG, "  → Entering safe infinite loop. Check I2C wiring.");
@@ -221,7 +224,8 @@ static void flight_control_loop_task(void* pvParameters)
                  SDA_IO, SCL_IO, MPU6050_ADDR);
 
         // ── Safe halt: prevent downstream instability ────────────────────
-        for (;;) {
+        for (;;)
+        {
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
@@ -234,9 +238,10 @@ static void flight_control_loop_task(void* pvParameters)
     uint8_t imu_raw[IMU_BURST_READ_LEN] = {};
     uint32_t loop_count = 0;
 
-    for (;;) {
+    for (;;)
+    {
         // ── SLA Timing Harness: capture pre-transaction timestamp ────────
-        int64_t t_start = esp_timer_get_time();  // Microsecond precision
+        int64_t t_start = esp_timer_get_time(); // Microsecond precision
 
         // ── Burst-read 14 bytes of IMU telemetry from 0x3B ──────────────
         esp_err_t read_err = mpu6050_burst_read(imu_raw);
@@ -244,10 +249,13 @@ static void flight_control_loop_task(void* pvParameters)
         // ── SLA Timing Harness: compute transaction delta ────────────────
         int64_t t_elapsed = esp_timer_get_time() - t_start;
 
-        if (read_err != ESP_OK) {
+        if (read_err != ESP_OK)
+        {
             ESP_LOGW(TAG, "⚠ IMU read error @ loop %lu: %s",
                      (unsigned long)loop_count, esp_err_to_name(read_err));
-        } else {
+        }
+        else
+        {
             // Debug-level trace: only visible with CORE_DEBUG_LEVEL >= 4
             // This lets us profile real I2C transaction overhead without
             // flooding the console at lower log verbosity settings.
@@ -280,6 +288,10 @@ static void flight_control_loop_task(void* pvParameters)
  */
 extern "C" void app_main(void)
 {
+    // Add a 2-second delay to allow the host PC to enumerate the USB port
+    // and attach the PlatformIO serial monitor before we start logging.
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
     ESP_LOGI(TAG, "╔══════════════════════════════════════════════════╗");
     ESP_LOGI(TAG, "║   Franken-E58  •  Phase 1 Flight Core Bootstrap ║");
     ESP_LOGI(TAG, "║   ESP32-S3  •  MPU-6050  •  ESP-IDF / FreeRTOS  ║");
@@ -288,10 +300,11 @@ extern "C" void app_main(void)
     // ── I2C Bus Initialisation ───────────────────────────────────────────
     ESP_LOGI(TAG, "⏳ Initialising I2C master bus...");
     esp_err_t i2c_err = i2c_master_init();
-    if (i2c_err != ESP_OK) {
+    if (i2c_err != ESP_OK)
+    {
         ESP_LOGE(TAG, "✗ FATAL: I2C init failed — aborting task creation.");
         ESP_LOGE(TAG, "  → System halted. Diagnose bus hardware and reboot.");
-        return;  // app_main returns; system remains alive but inert.
+        return; // app_main returns; system remains alive but inert.
     }
     ESP_LOGI(TAG, "✓ I2C master bus ready");
 
@@ -301,16 +314,17 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "⏳ Spawning flight_control_loop_task → Core 1...");
 
     BaseType_t task_err = xTaskCreatePinnedToCore(
-        flight_control_loop_task,   // Task function
-        "flight_ctrl",              // Human-readable name (max 16 chars)
-        4096,                       // Stack depth in bytes
-        NULL,                       // Parameters (unused in Phase 1)
-        10,                         // Priority: high (above default 1)
-        NULL,                       // Task handle (not needed yet)
-        1                           // Pin to Core 1
+        flight_control_loop_task, // Task function
+        "flight_ctrl",            // Human-readable name (max 16 chars)
+        4096,                     // Stack depth in bytes
+        NULL,                     // Parameters (unused in Phase 1)
+        10,                       // Priority: high (above default 1)
+        NULL,                     // Task handle (not needed yet)
+        1                         // Pin to Core 1
     );
 
-    if (task_err != pdPASS) {
+    if (task_err != pdPASS)
+    {
         ESP_LOGE(TAG, "✗ FATAL: Failed to create flight control task!");
         return;
     }
