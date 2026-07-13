@@ -34,6 +34,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+// ── Standard Math Library ────────────────────────────────────────────────────
+#include <math.h>
+
 // ── Diagnostic Log Tag ───────────────────────────────────────────────────────
 static const char *TAG = "FLIGHT_CORE";
 
@@ -63,6 +66,19 @@ static constexpr uint8_t MPU6050_CLK_SEL_X_GYRO = 0x01;
 
 //  IMU burst-read length: 3×accel + temp + 3×gyro = 14 bytes
 static constexpr size_t IMU_BURST_READ_LEN = 14;
+
+// ============================================================================
+//  IMU Scaling & Complementary Filter Constants
+// ============================================================================
+//  Default MPU-6050 full-scale ranges after reset:
+//    Accelerometer: ±2g  → 16384 LSB/g
+//    Gyroscope:     ±250°/s → 131 LSB/(°/s)
+// ============================================================================
+static constexpr float ACCEL_SCALE = 16384.0f;
+static constexpr float GYRO_SCALE  = 131.0f;
+static constexpr float RAD_TO_DEG  = 57.29577951f;  // 180.0 / π
+static constexpr float ALPHA       = 0.98f;          // Gyro trust weight
+static constexpr float DT          = 0.01f;          // 100 Hz → 10 ms step
 
 // ============================================================================
 //  I2C Master Bus Initialisation
@@ -186,10 +202,11 @@ static esp_err_t mpu6050_burst_read(uint8_t *buffer)
  * Lifecycle:
  *   1. Wake the MPU-6050 — hard-fault on failure (safe infinite loop).
  *   2. Enter deterministic control loop with SLA timing harness.
- *   3. Each iteration: burst-read IMU data → log transaction duration.
+ *   3. Each iteration: burst-read IMU → scale → trig → complementary filter.
  *
- * Phase 1 does NOT perform sensor fusion or motor output. That is
- * deferred to Phase 2 (complementary filter) and Phase 3 (PID → ESC PWM).
+ * Sensor fusion pipeline (per iteration):
+ *   raw int16 → float scaling → accel trig angles → complementary filter
+ *   → fused pitch/roll angles logged at ESP_LOGI level.
  *
  * @param pvParameters  Unused; reserved for future config struct passthrough.
  */
@@ -227,6 +244,12 @@ static void flight_control_loop_task(void *pvParameters)
     uint8_t imu_raw[IMU_BURST_READ_LEN] = {};
     uint32_t loop_count = 0;
 
+    // ── Complementary Filter state ───────────────────────────────────────
+    // Persistent across iterations; zeroed on boot — the filter self-
+    // corrects within ~1 s via the accelerometer gravity reference.
+    static float pitch_fused = 0.0f;
+    static float roll_fused  = 0.0f;
+
     for (;;)
     {
         // ── SLA Timing Harness: capture pre-transaction timestamp ────────
@@ -248,22 +271,52 @@ static void flight_control_loop_task(void *pvParameters)
             // ── Parse 14-byte big-endian IMU payload into signed 16-bit ──
             // Register map from 0x3B: AX_H AX_L AY_H AY_L AZ_H AZ_L
             //                         TH   TL   GX_H GX_L GY_H GY_L GZ_H GZ_L
-            int16_t accel_x = (int16_t)((imu_raw[0] << 8) | imu_raw[1]);
-            int16_t accel_y = (int16_t)((imu_raw[2] << 8) | imu_raw[3]);
-            int16_t accel_z = (int16_t)((imu_raw[4] << 8) | imu_raw[5]);
-            int16_t temp_raw = (int16_t)((imu_raw[6] << 8) | imu_raw[7]);
-            int16_t gyro_x = (int16_t)((imu_raw[8] << 8) | imu_raw[9]);
-            int16_t gyro_y = (int16_t)((imu_raw[10] << 8) | imu_raw[11]);
-            int16_t gyro_z = (int16_t)((imu_raw[12] << 8) | imu_raw[13]);
+            int16_t accel_x  = (int16_t)((imu_raw[0]  << 8) | imu_raw[1]);
+            int16_t accel_y  = (int16_t)((imu_raw[2]  << 8) | imu_raw[3]);
+            int16_t accel_z  = (int16_t)((imu_raw[4]  << 8) | imu_raw[5]);
+            int16_t temp_raw = (int16_t)((imu_raw[6]  << 8) | imu_raw[7]);
+            int16_t gyro_x   = (int16_t)((imu_raw[8]  << 8) | imu_raw[9]);
+            int16_t gyro_y   = (int16_t)((imu_raw[10] << 8) | imu_raw[11]);
+            int16_t gyro_z   = (int16_t)((imu_raw[12] << 8) | imu_raw[13]);
 
-            // Suppress unused-variable warning — temp_raw reserved for Phase 2
+            // Suppress unused-variable warnings — reserved for Phase 2
             (void)temp_raw;
+            (void)gyro_z;
 
+            // ── Scale raw integers to physical units ─────────────────────
+            //  Accel: LSB → g-force    Gyro: LSB → °/s
+            float accel_x_scaled = (float)accel_x / ACCEL_SCALE;
+            float accel_y_scaled = (float)accel_y / ACCEL_SCALE;
+            float accel_z_scaled = (float)accel_z / ACCEL_SCALE;
+            float gyro_x_scaled  = (float)gyro_x  / GYRO_SCALE;
+            float gyro_y_scaled  = (float)gyro_y  / GYRO_SCALE;
+
+            // ── Accelerometer-only angle estimation (trig) ──────────────
+            //  These angles are stable under static/slow motion but noisy
+            //  under vibration — hence the complementary filter below.
+            float pitch_acc = atan2f(accel_y_scaled,
+                                     sqrtf(accel_x_scaled * accel_x_scaled +
+                                           accel_z_scaled * accel_z_scaled))
+                              * RAD_TO_DEG;
+
+            float roll_acc  = atan2f(-accel_x_scaled, accel_z_scaled)
+                              * RAD_TO_DEG;
+
+            // ── Complementary Filter fusion ──────────────────────────────
+            //  High-pass on gyro (fast, driftless short-term) blended with
+            //  low-pass on accel (noisy but drift-free long-term).
+            //  ALPHA = 0.98 → 98% gyro trust, 2% accel correction per step.
+            pitch_fused = ALPHA * (pitch_fused + gyro_x_scaled * DT)
+                        + (1.0f - ALPHA) * pitch_acc;
+
+            roll_fused  = ALPHA * (roll_fused  + gyro_y_scaled * DT)
+                        + (1.0f - ALPHA) * roll_acc;
+
+            // ── Log fused angles + SLA timing ───────────────────────────
             ESP_LOGI(TAG,
-                     "µs: %lld | Ax: %d Ay: %d Az: %d | Gx: %d Gy: %d Gz: %d",
+                     "µs: %lld | Pitch: %.2f° | Roll: %.2f°",
                      (long long)t_elapsed,
-                     accel_x, accel_y, accel_z,
-                     gyro_x, gyro_y, gyro_z);
+                     pitch_fused, roll_fused);
         }
 
         loop_count++;
